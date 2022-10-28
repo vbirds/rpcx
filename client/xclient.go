@@ -54,6 +54,7 @@ type XClient interface {
 
 	Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error)
 	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
+	AsyncCall(ctx context.Context, serviceMethod string, args interface{}, callback interface{}) error
 	Broadcast(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Fork(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Inform(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) ([]Receipt, error)
@@ -677,6 +678,47 @@ func contextCanceled(err error) bool {
 	}
 
 	return false
+}
+
+func (c *xClient) AsyncCall(ctx context.Context, serviceMethod string, args interface{}, callback interface{}) error {
+	if c.isShutdown {
+		return ErrXClientShutdown
+	}
+
+	if c.auth != "" {
+		metadata := ctx.Value(share.ReqMetaDataKey)
+		if metadata == nil {
+			metadata = map[string]string{}
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
+		}
+		m := metadata.(map[string]string)
+		m[share.AuthKey] = c.auth
+	}
+
+	ctx = setServerTimeout(ctx)
+
+	if share.Trace {
+		log.Debugf("select a client for %s.%s, failMode: %v, args: %+v in case of xclient Call", c.servicePath, serviceMethod, c.failMode, args)
+	}
+
+	var err error
+	_, client, err := c.selectClient(ctx, c.servicePath, serviceMethod, args)
+	if err != nil {
+		if c.failMode == Failfast || contextCanceled(err) {
+			return err
+		}
+	}
+
+	if share.Trace {
+		log.Debugf("selected a client %s for %s.%s, args: %+v in case of xclient AsyncCall", client.RemoteAddr(), c.servicePath, serviceMethod, args)
+	}
+
+	if client == nil {
+		log.Errorf("selected a client failed %s.%s, args: %+v in case of xclient AsyncCall", c.servicePath, serviceMethod, args)
+		return ErrXClientNoServer
+	}
+
+	return client.AsyncCall(ctx, c.servicePath, serviceMethod, args, callback)
 }
 
 func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error) {

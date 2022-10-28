@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -32,6 +33,8 @@ const (
 	XMeta              = "X-RPCX-Meta"
 	XErrorMessage      = "X-RPCX-ErrorMessage"
 )
+
+var nilError = reflect.Zero(reflect.TypeOf((*error)(nil)).Elem())
 
 // ServiceError is an error from server.
 type ServiceError interface {
@@ -90,11 +93,14 @@ const (
 
 type seqKey struct{}
 
+//type RpcClientAsyncCallback func(call *Call, err error, reply interface{}) error
+
 // RPCClient is interface that defines one client to call one server.
 type RPCClient interface {
 	Connect(network, address string) error
 	Go(ctx context.Context, servicePath, serviceMethod string, args interface{}, reply interface{}, done chan *Call) *Call
 	Call(ctx context.Context, servicePath, serviceMethod string, args interface{}, reply interface{}) error
+	AsyncCall(ctx context.Context, servicePath, serviceMethod string, args interface{}, callback interface{}) error
 	SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error)
 	Close() error
 	RemoteAddr() string
@@ -197,6 +203,8 @@ type Call struct {
 	Error         error       // After completion, the error status.
 	Done          chan *Call  // Strobes when call is complete.
 	Raw           bool        // raw message or not
+	Asyc          bool        // mark async call
+	AsyncFunc     *reflect.Value
 }
 
 func (call *Call) done() {
@@ -330,6 +338,51 @@ func (client *Client) call(ctx context.Context, servicePath, serviceMethod strin
 	}
 
 	return err
+}
+
+func (client *Client) AsyncCall(ctx context.Context, servicePath, serviceMethod string, args interface{}, callback interface{}) error {
+	seq := new(uint64)
+	ctx = context.WithValue(ctx, seqKey{}, seq)
+
+	if share.Trace {
+		log.Debugf("client.call for %s.%s, args: %+v in case of client call", servicePath, serviceMethod, args)
+		defer func() {
+			log.Debugf("client.call done for %s.%s, args: %+v in case of client call", servicePath, serviceMethod, args)
+		}()
+	}
+
+	call := new(Call)
+	call.ServicePath = servicePath
+	call.ServiceMethod = serviceMethod
+	meta := ctx.Value(share.ReqMetaDataKey)
+	if meta != nil { // copy meta in context to meta in requests
+		call.Metadata = meta.(map[string]string)
+	}
+
+	if !share.IsShareContext(ctx) {
+		ctx = share.NewContext(ctx)
+	}
+
+	fVal := reflect.ValueOf(callback)
+
+	if fVal.Kind() != reflect.Func {
+		err := errors.New("call " + serviceMethod + " input callback param is error!")
+		log.Errorf(err.Error())
+		return err
+	}
+
+	call.Reply = reflect.New(fVal.Type().In(0).Elem()).Interface()
+	call.Args = args
+	call.Asyc = true
+	call.AsyncFunc = &fVal
+
+	if share.Trace {
+		log.Debugf("client.Go send request for %s.%s, args: %+v in case of client call", servicePath, serviceMethod, args)
+	}
+
+	go client.send(ctx, call)
+
+	return nil
 }
 
 // SendRaw sends raw messages. You don't care args and replies.
@@ -602,6 +655,7 @@ func (client *Client) input() {
 
 		err = res.Decode(client.r)
 		if err != nil {
+			println("error")
 			break
 		}
 		if client.Plugins != nil {
@@ -654,7 +708,18 @@ func (client *Client) input() {
 					_ = codec.Decode(data, call.Reply)
 				}
 			}
-			call.done()
+			// TODO: async call
+			if call.Asyc {
+				if call.AsyncFunc != nil {
+					if call.Error == nil {
+						call.AsyncFunc.Call([]reflect.Value{reflect.ValueOf(call.Reply), reflect.ValueOf(nilError)})
+					} else {
+						call.AsyncFunc.Call([]reflect.Value{reflect.ValueOf(call.Reply), reflect.ValueOf(call.Error)})
+					}
+				}
+			} else {
+				call.done()
+			}
 		default:
 			if call.Raw {
 				call.Metadata, call.Reply, _ = convertRes2Raw(res)
@@ -674,10 +739,20 @@ func (client *Client) input() {
 				if len(res.Metadata) > 0 {
 					call.ResMetadata = res.Metadata
 				}
-
 			}
 
-			call.done()
+			// TODO: ansy call
+			if call.Asyc {
+				if call.AsyncFunc != nil {
+					if call.Error == nil {
+						call.AsyncFunc.Call([]reflect.Value{reflect.ValueOf(call.Reply), nilError})
+					} else {
+						call.AsyncFunc.Call([]reflect.Value{reflect.ValueOf(call.Reply), reflect.ValueOf(call.Error)})
+					}
+				}
+			} else {
+				call.done()
+			}
 		}
 	}
 	// Terminate pending calls.
@@ -745,6 +820,8 @@ func (client *Client) handleServerRequest(msg *protocol.Message) {
 			}
 		}
 	}
+
+	// todo async callback
 }
 
 func (client *Client) heartbeat() {
