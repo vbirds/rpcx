@@ -65,6 +65,7 @@ var DefaultOption = Option{
 	MaxWaitForHeartbeat: 30 * time.Second,
 	TCPKeepAlivePeriod:  time.Minute,
 	BidirectionalBlock:  false,
+	TimeToDisallow:      time.Minute,
 }
 
 // Breaker is a CircuitBreaker interface.
@@ -159,6 +160,8 @@ type Option struct {
 
 	// Retries retries to send
 	Retries int
+	// Time to disallow the bad server not to be selected
+	TimeToDisallow time.Duration
 
 	// TLSConfig for tcp and quic
 	TLSConfig *tls.Config
@@ -562,7 +565,7 @@ func (client *Client) send(ctx context.Context, call *Call) {
 	}
 
 	// req := protocol.NewMessage()
-	req := protocol.GetPooledMsg()
+	req := protocol.NewMessage()
 	req.SetMessageType(protocol.Request)
 	req.SetSeq(seq)
 	if call.Reply == nil {
@@ -622,12 +625,11 @@ func (client *Client) send(ctx context.Context, call *Call) {
 			call.Error = err
 			call.done()
 		}
-		protocol.FreeMsg(req)
+
 		return
 	}
 
 	isOneway := req.IsOneway()
-	protocol.FreeMsg(req)
 
 	if isOneway {
 		client.mutex.Lock()
